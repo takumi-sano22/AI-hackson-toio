@@ -710,7 +710,7 @@ function enterRescue(kind, targetIdx) {
     preludeUntil: now + RESCUE_PRELUDE_MS, // ここまでは動かず、音楽で救助開始を予告する
     retries: 0,
     step: "APPROACH", // STUCK_ON_MATのみ使用: "APPROACH" | "ACT" | "BUMP"
-    approachStartedAt: now, // 接近の見切り判定用
+    approachStartedAt: now + RESCUE_PRELUDE_MS, // 接近の見切りは予告演出が明けてから数え始める
     nextActAt: 0,
   };
   // 遷移直後から救助中と分かるようLEDを点ける
