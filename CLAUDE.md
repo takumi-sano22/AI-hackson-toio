@@ -12,8 +12,8 @@
 | --- | --- |
 | 実行環境 | ブラウザ。Web Bluetooth で toio Core Cube に接続する |
 | ライブラリ | p5.js + [p5.toio](https://tetunori.github.io/p5.toio/)（CDN 読み込み。ビルド工程なし） |
-| エントリ | `index.html` から p5.toio と各スクリプトを読み込む |
-| 既存ファイル | `sample.js` … toio の 2D デジタルツイン表示サンプル（接続・位置/角度表示・キー操作） |
+| 現在のファイル | `sample.js` のみ（toio の 2D デジタルツイン表示サンプル。接続・位置/角度表示・キー操作） |
+| エントリ | **未作成**。デモ実行には `index.html` を追加し、p5.js・p5.toio・各スクリプトを読み込む必要がある |
 
 > Web Bluetooth は HTTPS もしくは `localhost` でしか動かない。ローカル確認時はローカルサーバを立てる。
 
