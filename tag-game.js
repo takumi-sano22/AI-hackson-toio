@@ -20,15 +20,17 @@ const LEAD_TIME = 0.35; // 鬼の先読み秒数
 const CATCH_DIST = 45; // 捕獲判定距離（接触する前に成立させたいので車体サイズより広くとる）
 const CATCH_HOLD_MS = 300; // 捕獲成立に必要な継続時間
 const LOST_MS = 800; // 座標ロスト判定時間
-const STUCK_EPS = 5; // これ未満の移動量は「動いていない」とみなす
+// 障害物に押し付けられて空転していると、座標ノイズや微小な首振りだけで5程度は「動いて」しまい、
+// スタックと判定されず救助が発動しなかった。正常走行なら1.5秒で15を大きく超えるため閾値を上げる
+const STUCK_EPS = 15; // これ未満の移動量は「動いていない」とみなす
 const STUCK_MS = 1500; // マット内スタック判定時間（低速化で1コマンドあたりの移動が遅くなるため緩めた）
 const BACK_MS = 600; // 後退の基本時間
 const RETRY_MAX = 6; // 救助リトライ上限（3戦術を2周試せる回数にしている）
 const RESCUE_TIMEOUT = 15000; // 救助断念までの時間（戦術が増えたぶん延長）
 const RESCUE_PRELUDE_MS = 1600; // 救助開始前の予告演出の長さ（音楽を鳴らし終えてから動き出す）
 const APPROACH_GIVEUP_MS = 3500; // 接近をあきらめて次の戦術に切り替えるまでの時間
-const REGROUP_MIN_MS = 1000; // 仕切り直しの最低待機時間（定位置に着いても一拍おいて再開する）
-const REGROUP_TIMEOUT = 8000; // 定位置に戻れなくてもデモを止めないための打ち切り時間
+const REGROUP_HOLD_MS = 3000; // 全機がスタート地点に揃ってから再スタートまでの待機時間
+const REGROUP_TIMEOUT = 12000; // 定位置に戻れなくてもデモを止めないための打ち切り時間（待機ぶん延長）
 const HOME_ARRIVE_DIST = 30; // スタート地点に戻ったとみなす距離
 
 // 速度（有効値域は 8..115。0 と ±8..115 以外は無効）
@@ -142,6 +144,7 @@ let catchSince = null; // CHASE中、捕獲距離内に入り続けている開�
 let rescue = null; // RESCUE/HELP_NEEDED中の救助コンテキスト
 let celebrate = null; // CELEBRATE中の勝利ダンスのコンテキスト
 let regroupStartedAt = 0; // REGROUPに入った時刻
+let regroupArrivedAt = null; // 全機がスタート地点に揃った時刻。ここから数秒待って再スタートする
 let pausedFromPhase = null; // PAUSEDに入る直前のphase（スペースキーで復帰するため）
 let pausedAt = 0; // PAUSEDに入った時刻（復帰時に各期限を停止時間ぶん後ろへずらす）
 let blinkOn = false; // LED点滅の状態
@@ -277,6 +280,7 @@ function togglePause() {
       celebrate.nextStepAt += pausedMs;
     }
     regroupStartedAt += pausedMs;
+    if (regroupArrivedAt !== null) regroupArrivedAt += pausedMs;
     if (catchSince !== null) catchSince += pausedMs;
     obstacles.forEach((o) => (o.lastAt += pausedMs)); // 停止中に障害物を忘れないようにする
 
@@ -533,8 +537,8 @@ function updateChase() {
   const chaserSt = states[chaserIdx];
   const runnerSt = states[runnerIdx];
 
-  // トラブル検知はCHASE中のみ行う。REGROUP/RESCUE/PAUSED中は意図的な停止があるため誤検知を防ぐ
-  const trouble = findTroubleIdx();
+  // RESCUE/PAUSED中は意図的な停止があるため検知しない。REGROUPでは帰還中の機に限って検知する
+  const trouble = findTroubleIdx([chaserIdx, runnerIdx]);
   if (trouble !== null) {
     // マット上で動けなくなった地点には障害物がある可能性が高い。共通マップに残して以後避ける
     if (trouble.kind === "STUCK_ON_MAT") registerObstacle(trouble.idx);
@@ -635,11 +639,12 @@ function clampToSafe(p) {
   };
 }
 
-function findTroubleIdx() {
+function findTroubleIdx(indices) {
   // OFF_MAT: 座標ロストがLOST_MSを超えて継続
   // STUCK_ON_MAT: マット内で座標は読めているが移動が無い状態がSTUCK_MSを超えて継続
+  // 検知対象は呼び出し元が絞る（意図的に静止している機を誤検知しないため）
   const now = millis();
-  for (const idx of [chaserIdx, runnerIdx]) {
+  for (const idx of indices) {
     const st = states[idx];
     if (st.lostSince !== null && now - st.lostSince > LOST_MS) {
       return { kind: "OFF_MAT", idx };
@@ -915,6 +920,9 @@ function enterRegroup() {
   rescue = null;
   celebrate = null;
   regroupStartedAt = millis();
+  regroupArrivedAt = null;
+  // ダンス・救助中の意図的な静止をスタック判定に持ち越すと、帰還開始直後に誤救助が発動する
+  resetStuckDetection();
   cubes.forEach((cube) => setLight(cube, LED_HOME));
 }
 
@@ -923,16 +931,19 @@ function updateRegroup() {
   // 起動地点＝各機のスタート地点へ戻してから再開する。役割交代は捕獲時に済ませているのでここでは触らない
   const now = millis();
   let allArrived = true;
+  const movingIdx = []; // まだ帰還中の機。トラブル検知はこの機だけを対象にする
 
   cubes.forEach((cube, i) => {
     const st = states[i];
     const home = homePosOf(i);
     if (st.pos === null) {
       allArrived = false; // 座標が読めない機は到着とみなさない
+      movingIdx.push(i);
       return;
     }
     if (vDist(st.pos, home) > HOME_ARRIVE_DIST) {
       allArrived = false;
+      movingIdx.push(i);
       if (now - st.lastCmdAt > MOVE_INTERVAL) {
         cube.moveTo(home, SPEED);
         st.lastCmdAt = now;
@@ -940,9 +951,26 @@ function updateRegroup() {
     }
   });
 
-  const elapsed = now - regroupStartedAt;
-  // 全機が定位置に着いたら一拍おいて再開。戻れない機がいてもデモが止まらないよう打ち切りも設ける
-  if ((allArrived && elapsed > REGROUP_MIN_MS) || elapsed > REGROUP_TIMEOUT) {
+  // 帰り道でも障害物に引っかかったり、マット外へ落ちたりしたら救助へ。
+  // 到着済みの機は意図的に静止しているため検知対象から外す（誤救助の防止）
+  const trouble = findTroubleIdx(movingIdx);
+  if (trouble !== null) {
+    if (trouble.kind === "STUCK_ON_MAT") registerObstacle(trouble.idx);
+    enterRescue(trouble.kind, trouble.idx);
+    return;
+  }
+
+  // 全機がスタート地点に揃ってから数秒待機し、それから再スタートする。
+  // 途中で位置がずれたら（手で動かされた等）待機を数え直す
+  if (allArrived) {
+    if (regroupArrivedAt === null) regroupArrivedAt = now;
+  } else {
+    regroupArrivedAt = null;
+  }
+  const holdDone =
+    regroupArrivedAt !== null && now - regroupArrivedAt > REGROUP_HOLD_MS;
+  // 戻れない機がいてもデモが止まらないよう打ち切りも設ける
+  if (holdDone || now - regroupStartedAt > REGROUP_TIMEOUT) {
     enterChase(); // CHASE遷移時にLEDが役割色(赤/青)へ戻る
   }
 }
@@ -1148,7 +1176,13 @@ function drawHud() {
   }
   if (phase === "REGROUP") {
     fill(80);
-    text("スタート地点へ戻って仕切り直し中", x, y);
+    text(
+      regroupArrivedAt !== null
+        ? "スタート地点で待機中（数秒後に再スタート）"
+        : "スタート地点へ戻って仕切り直し中",
+      x,
+      y
+    );
     y += lineH;
     fill(20);
   }
