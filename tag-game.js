@@ -444,7 +444,15 @@ function registerObstacle(idx) {
     return;
   }
 
-  if (obstacles.length >= OBSTACLE_MAX) obstacles.shift(); // 古いものから捨てる
+  // 上限に達したら「最後に検知した時刻が最も古い」ものを捨てる。
+  // 挿入順（shift）で捨てると、直近に再検知したばかりの現役の障害物が消えてしまう
+  if (obstacles.length >= OBSTACLE_MAX) {
+    let oldest = 0;
+    obstacles.forEach((o, i) => {
+      if (o.lastAt < obstacles[oldest].lastAt) oldest = i;
+    });
+    obstacles.splice(oldest, 1);
+  }
   obstacles.push({ x: p.x, y: p.y, hits: 1, lastAt: now });
 }
 
@@ -461,7 +469,13 @@ function obstacleRepulsion(p) {
   let v = { x: 0, y: 0 };
   obstacles.forEach((o) => {
     const d = vDist(p, o);
-    if (d >= OBSTACLE_RANGE || d === 0) return;
+    if (d >= OBSTACLE_RANGE) return;
+    if (d === 0) {
+      // 進行方向が取れずキューブの真下に登録された場合。離れる向きが決まらないので
+      // マット中心へ逃がす（ここで諦めると記録した地点をまったく避けられなくなる）
+      v = vAdd(v, vNorm(vSub({ x: MAT.centerX, y: MAT.centerY }, p)));
+      return;
+    }
     v = vAdd(v, vScale(vNorm(vSub(p, o)), (OBSTACLE_RANGE - d) / OBSTACLE_RANGE));
   });
   return v;
