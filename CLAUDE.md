@@ -23,6 +23,11 @@
 - 開発フローは **global 版 `github-workflow` を既定**とし、コード/ドキュメント変更は Issue → ブランチ → PR → 2段階レビュー（Claude 自己レビュー → Codex）の標準フローに従う。
 - ほかは作業内容に応じて `create-issue` / `code-review` / `model-selection` / `subagent-briefing` 等の global skill を参照する。
 
+## レビュー運用（ハッカソン中の短縮ルール）
+
+- **Codex レビューは 1 PR につき 1 回だけ**実行する。指摘があれば修正し、**再レビューはせずマージしてよい**（時間短縮を優先するため）。
+- ただし破壊的/不可逆な変更・認証/認可・設計の根本変更に該当する場合は、マージせず人間確認で停止する。
+
 ## 規約
 
 - Issue / PR タイトルの prefix は `[toio]`。
