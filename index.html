@@ -1,0 +1,24 @@
+<!DOCTYPE html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8" />
+    <title>toio 鬼ごっこ＋救助・仕切り直し</title>
+    <style>
+      body {
+        margin: 0;
+      }
+    </style>
+  </head>
+  <body>
+    <!--
+      注意: Web Bluetooth は HTTPS または localhost 配信でしか動作しない。
+      file:// で直接開くと toio に接続できないため、
+      ローカル確認時は `python3 -m http.server` 等でサーバを立てて開くこと。
+      p5.js Web Editor に貼る場合はそのまま動作する。
+    -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/p5.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.0/addons/p5.sound.min.js"></script>
+    <script src="https://tetunori.github.io/p5.toio/dist/0.5.0/p5.toio.min.js"></script>
+    <script src="tag-game.js"></script>
+  </body>
+</html>
