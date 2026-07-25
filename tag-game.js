@@ -32,6 +32,7 @@ const RESCUE_PRELUDE_MS = 1600; // 救助開始前の予告演出の長さ（音
 const BUMP_WINDOW_MIN_MS = 250; // 衝突直後は平滑化した速度がまだ落ちきっていないため、判定を少し待つ
 const BUMP_WINDOW_MAX_MS = 900; // 衝突からこの時間内に減速が確認できたら「ぶつかって止まった」とみなす
 const BUMP_SLOW_SPEED = 15; // これ未満の実測速度（座標/秒）を「想定より遅い」とみなす
+const BUMP_SLOW_MS = 500; // 走れていた機の速度が落ちたままこの時間続いたら、衝突イベントが無くても救助へ
 const BUMP_IGNORE_GAP = 70; // 2台がこの距離以内での衝突はお互いの接触（捕獲判定に任せる）なので無視
 const REGROUP_HOLD_MS = 3000; // 全機がスタート地点に揃ってから再スタートまでの待機時間
 const REGROUP_TIMEOUT = 12000; // 定位置に戻れなくてもデモを止めないための打ち切り時間（待機ぶん延長）
@@ -193,6 +194,8 @@ function makeCubeState() {
     lastMoveAt: 0, // 最後に基準座標からSTUCK_EPS以上離れた時刻(millis)
     lastCmdAt: 0, // 最後にBLEコマンドを送った時刻
     lastCollisionAt: -10000, // 直近の衝突イベント時刻（「ぶつかって止まった」判定に使う）
+    slowSince: null, // 実測速度がBUMP_SLOW_SPEED未満に落ちた時刻
+    wasRunning: false, // 一度でも走れて（十分な速度が出て）いたか。停止明けの誤検知を防ぐ
   };
 }
 
@@ -360,6 +363,16 @@ function updateStates() {
         st.lastHeading = vNorm(st.velocity);
       }
 
+      // 「走れていたのに遅くなった」の検知用。閾値ちょうどで判定が往復しないよう、
+      // 「走れている」認定は少し高い速度(1.5倍)で行う
+      const spd = vLen(st.velocity);
+      if (spd >= BUMP_SLOW_SPEED) {
+        st.slowSince = null;
+        if (spd > BUMP_SLOW_SPEED * 1.5) st.wasRunning = true;
+      } else if (st.slowSince === null) {
+        st.slowSince = now;
+      }
+
       // スタック判定は「基準座標からSTUCK_EPS以上離れたか」で見る。
       // 前フレームとの差分で見ると、60fpsでは正常走行中でも1フレームの移動量が
       // STUCK_EPSを下回るため、走れているのに常時スタック扱いになってしまう
@@ -376,6 +389,7 @@ function updateStates() {
       // --- マット外などで座標が読めない場合 ---
       st.pos = null;
       st.stillAnchor = null; // 復帰時に基準を取り直す（ロスト中の停止をスタックとして数えない）
+      st.slowSince = null; // ロスト中は速度が更新されないため減速判定を止める
       if (st.lostSince === null) st.lostSince = now;
     }
   });
@@ -452,6 +466,10 @@ function resetStuckDetection() {
   states.forEach((st) => {
     st.stillAnchor = null;
     st.lastMoveAt = now;
+    // 意図的に止まっていた区間の低速を持ち越さない。走り出しの遅さも誤検知しないよう、
+    // 再び十分な速度が出るまで減速検知(BUMPED)は武装解除しておく
+    st.slowSince = null;
+    st.wasRunning = false;
   });
 }
 
@@ -589,7 +607,18 @@ function findTroubleIdx(indices) {
     ) {
       return { kind: "BUMPED", idx };
     }
-    // 衝突イベントを拾えない引っかかり方への保険（従来のスタック検知）
+    // 走れていたのに速度が落ちたまま続く＝何かに引っかかっている。
+    // 衝突イベントを拾えない止まり方でも、鬼が追いついて捕獲が成立する前に素早く救助へ入る
+    if (
+      st.pos !== null &&
+      st.wasRunning &&
+      st.slowSince !== null &&
+      now - st.slowSince > BUMP_SLOW_MS &&
+      (gap === null || gap > BUMP_IGNORE_GAP)
+    ) {
+      return { kind: "BUMPED", idx };
+    }
+    // それでも拾えない場合の最後の保険（従来のスタック検知）
     if (st.pos !== null && now - st.lastMoveAt > STUCK_MS) {
       return { kind: "BUMPED", idx };
     }
