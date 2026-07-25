@@ -186,11 +186,11 @@ function setup() {
   connectBtn.mousePressed(connectToio);
   // 接続した瞬間に走り出すと toio を置く時間がないため、開始は明示的にボタンで行う
   startBtn = createButton("ゲームスタート");
-  startBtn.position(190, 20);
+  startBtn.position(200, 20);
   startBtn.mousePressed(startGame);
   startBtn.attribute("disabled", ""); // 2台そろうまでは押せない
   fsBtn = createButton("全画面表示");
-  fsBtn.position(300, 20);
+  fsBtn.position(320, 20);
   fsBtn.mousePressed(toggleFullscreen);
 }
 
@@ -400,7 +400,12 @@ function updatePhase() {
 
 // ==== LED・効果音 ====
 function setLight(cube, rgb) {
-  cube.turnLightOnRGB(rgb[0], rgb[1], rgb[2]);
+  // turnLightOnRGB を持たないバージョンでもデモが止まらないよう、色オブジェクト版へ退避する
+  if (typeof cube.turnLightOnRGB === "function") {
+    cube.turnLightOnRGB(rgb[0], rgb[1], rgb[2]);
+  } else {
+    cube.turnLightOn(color(rgb[0], rgb[1], rgb[2]));
+  }
 }
 
 function playSound(cube, seId) {
@@ -878,7 +883,9 @@ function enterHelpNeeded() {
   lastBlinkAt = millis();
   lastSoundAt = 0; // すぐ呼び出し音を鳴らす
   blinkOn = false;
-  // helperのLEDは緑のまま維持し、rescueコンテキストもクリアしない（復帰判定に使い続けるため）
+  // 点滅の消灯タイミングでRESCUEを抜けるとhelperが消灯のまま残るため、ここで緑に点け直す。
+  // rescueコンテキストは復帰判定に使い続けるのでクリアしない
+  setLight(cubes[rescue.helperIdx], LED_RESCUER);
 }
 
 function updateHelpNeeded() {
