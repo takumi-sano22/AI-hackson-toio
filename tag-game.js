@@ -118,11 +118,14 @@ const COLOR_MAIN = [0, 133, 250, 100]; // 少し透明なシアン
 const cubes = []; // P5tCube（接続順）
 const states = []; // 各キューブの CubeState
 const obstacles = []; // 障害物マップ {x, y, hits, lastAt}。2台がこの1つを共有して回避する
-let phase = "WAITING"; // "WAITING" | "CHASE" | "CELEBRATE" | "RESCUE" | "REGROUP" | "HELP_NEEDED" | "PAUSED"
+// "WAITING"（接続待ち） | "READY"（接続済み・スタート待ち） | "CHASE" | "CELEBRATE"
+// | "RESCUE" | "REGROUP" | "HELP_NEEDED" | "PAUSED"
+let phase = "WAITING";
 let chaserIdx = 0;
 let runnerIdx = 1;
 
 let connectBtn; // 接続ボタン
+let startBtn; // ゲームスタートボタン
 let fsBtn; // 全画面表示ボタン
 
 let catchSince = null; // CHASE中、捕獲距離内に入り続けている開始時刻
@@ -181,9 +184,25 @@ function setup() {
   connectBtn = createButton("toioを接続する（2台必要）");
   connectBtn.position(20, 20);
   connectBtn.mousePressed(connectToio);
+  // 接続した瞬間に走り出すと toio を置く時間がないため、開始は明示的にボタンで行う
+  startBtn = createButton("ゲームスタート");
+  startBtn.position(190, 20);
+  startBtn.mousePressed(startGame);
+  startBtn.attribute("disabled", ""); // 2台そろうまでは押せない
   fsBtn = createButton("全画面表示");
-  fsBtn.position(190, 20);
+  fsBtn.position(300, 20);
   fsBtn.mousePressed(toggleFullscreen);
+}
+
+function startGame() {
+  if (cubes.length < 2) return;
+  // 押した時点の位置をスタート地点として記録し直す。
+  // 置き終わってから押してもらう前提なので、ここが「起動地点」になる
+  states.forEach((st) => {
+    st.homePos = st.pos;
+  });
+  startBtn.html("リスタート");
+  enterChase();
 }
 
 function connectToio() {
@@ -202,9 +221,10 @@ function connectToio() {
       playSound(cube, SE_HIT);
     });
 
-    // 2台そろうまではゲームロジックを動かさない。そろった瞬間にCHASEを開始する
+    // 2台そろってもすぐには始めない。配置を終えてスタートを押すまでREADYで待つ
     if (cubes.length >= 2 && phase === "WAITING") {
-      enterChase();
+      phase = "READY";
+      startBtn.removeAttribute("disabled");
     }
   });
 }
@@ -221,12 +241,14 @@ function keyPressed() {
   // キーボード操作
   if (key === "c" || key === "C") connectToio();
   if (key === "f" || key === "F") toggleFullscreen();
+  if (key === "s" || key === "S") startGame();
   if (key === "r" || key === "R") {
-    // 強制的に仕切り直しへ戻す（HELP_NEEDEDからの手動復帰も兼ねる）
-    if (cubes.length >= 2) enterRegroup();
+    // 強制的に仕切り直しへ戻す（HELP_NEEDEDからの手動復帰も兼ねる）。
+    // スタート前は戻る先が未確定なので受け付けない
+    if (cubes.length >= 2 && phase !== "READY") enterRegroup();
   }
   if (key === "o" || key === "O") obstacles.length = 0; // 誤検知が溜まったときのリセット用
-  if (key === " ") togglePause();
+  if (key === " " && phase !== "READY") togglePause();
 }
 
 function togglePause() {
@@ -280,8 +302,12 @@ function draw() {
   drawObstacles();
   drawHomes();
   if (cubes.length < 2) {
-    drawWaitingMessage();
+    drawWaitingMessage("c キー / ボタンで接続してください（2台必要）");
   } else {
+    // READY中もキューブは描画する。置いた位置を画面で確かめてからスタートできるようにする
+    if (phase === "READY") {
+      drawWaitingMessage("toio を置いたら [ゲームスタート] を押してください");
+    }
     drawCubes();
   }
   pop();
@@ -317,11 +343,6 @@ function updateStates() {
         st.lastHeading = vNorm(st.velocity);
       }
 
-      // 起動地点を1度だけ記録する。仕切り直しは以後この座標へ戻す
-      if (st.homePos === null) {
-        st.homePos = newPos;
-      }
-
       // スタック判定は「基準座標からSTUCK_EPS以上離れたか」で見る。
       // 前フレームとの差分で見ると、60fpsでは正常走行中でも1フレームの移動量が
       // STUCK_EPSを下回るため、走れているのに常時スタック扱いになってしまう
@@ -350,10 +371,12 @@ function updatePhase() {
     return;
   }
   if (phase === "WAITING") {
-    // 通常はconnectToio()内で遷移済みだが、念のためここでも開始する
-    enterChase();
+    // 通常はconnectToio()内で遷移済みだが、念のためここでもREADYへ上げる
+    phase = "READY";
+    startBtn.removeAttribute("disabled");
     return;
   }
+  if (phase === "READY") return; // スタートボタン待ち。toioは動かさない
   if (phase === "PAUSED") return; // 一時停止中は何もしない
 
   switch (phase) {
@@ -950,12 +973,12 @@ function drawHomes() {
   }
 }
 
-function drawWaitingMessage() {
+function drawWaitingMessage(message) {
   fill(100);
   noStroke();
   textSize(20);
   textAlign(CENTER, CENTER);
-  text("c キー / ボタンで接続してください（2台必要）", BASE_W / 2, BASE_H / 6);
+  text(message, BASE_W / 2, BASE_H / 6);
 }
 
 function drawCubes() {
@@ -1020,6 +1043,12 @@ function drawHud() {
   text(`phase: ${phase}`, x, y);
   y += lineH;
 
+  if (phase === "READY") {
+    fill(0, 110, 200);
+    text("スタート待ち（押した位置がスタート地点になります）", x, y);
+    y += lineH;
+    fill(20);
+  }
   if (phase === "CELEBRATE") {
     fill(210, 140, 0);
     text(`Cube${celebrate.winnerIdx + 1} の勝ち！ ダンス中`, x, y);
@@ -1083,6 +1112,10 @@ function drawHud() {
   }
 
   y += 6;
-  text("[c]接続 [r]仕切り直し [o]障害物クリア [f]全画面 [space]一時停止", x, y);
+  text(
+    "[c]接続 [s]スタート/リスタート [r]仕切り直し [o]障害物クリア [f]全画面 [space]一時停止",
+    x,
+    y
+  );
   pop();
 }
