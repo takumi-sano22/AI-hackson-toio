@@ -23,8 +23,10 @@ const LOST_MS = 800; // 座標ロスト判定時間
 const STUCK_EPS = 5; // これ未満の移動量は「動いていない」とみなす
 const STUCK_MS = 1500; // マット内スタック判定時間（低速化で1コマンドあたりの移動が遅くなるため緩めた）
 const BACK_MS = 600; // 後退の基本時間
-const RETRY_MAX = 3; // 救助リトライ上限
-const RESCUE_TIMEOUT = 10000; // 救助断念までの時間
+const RETRY_MAX = 6; // 救助リトライ上限（3戦術を2周試せる回数にしている）
+const RESCUE_TIMEOUT = 15000; // 救助断念までの時間（戦術が増えたぶん延長）
+const RESCUE_PRELUDE_MS = 1600; // 救助開始前の予告演出の長さ（音楽を鳴らし終えてから動き出す）
+const APPROACH_GIVEUP_MS = 3500; // 接近をあきらめて次の戦術に切り替えるまでの時間
 const REGROUP_MIN_MS = 1000; // 仕切り直しの最低待機時間（定位置に着いても一拍おいて再開する）
 const REGROUP_TIMEOUT = 8000; // 定位置に戻れなくてもデモを止めないための打ち切り時間
 const HOME_ARRIVE_DIST = 30; // スタート地点に戻ったとみなす距離
@@ -33,6 +35,8 @@ const HOME_ARRIVE_DIST = 30; // スタート地点に戻ったとみなす距離
 const SPEED = 35; // 通常速度。挙動を目で追える速さを優先して低めにしている
 const NEAR_SPEED = 20; // 接近中の鬼の速度。全速のまま突っ込ませない
 const RESCUE_SPEED = 25; // 救助時の低速
+const PUSH_SPEED = 50; // 押し出し瞬間の速度（RESCUE_SPEEDのままだと押し負けて動かせないことがある）
+const ESCAPE_SPEED = 35; // スタック脱出時に本人が出す速度
 const NEAR_DIST = 90; // これ以内を「接近中」とみなす（鬼は減速・逃げは横へ回り込む）
 
 const BUMP_MS = 400; // 押し出し時間
@@ -69,7 +73,6 @@ const HELP_BLINK_MS = 500; // 人待ち中の点滅周期
 const DANCE_MS = 3200; // 踊る時間
 const DANCE_STEP_MS = 350; // 回転の向き・色を切り替える間隔
 const DANCE_SPEED = 45; // 勝者のスピン速度
-const DANCE_LOSER_RATIO = 0.6; // 負けた側は控えめに踊る
 const DANCE_COLORS = [
   [255, 0, 0],
   [255, 180, 0],
@@ -96,6 +99,13 @@ const HELP_MELODY = [
   { note: 88, duration: 200 },
   { note: 128, duration: 150 },
   { note: 88, duration: 200 },
+];
+// 救助開始の予告ジングル（出動ラッパ風）。鳴らし終えるまで動かず「今から救助する」ことを観客に予告する
+const RESCUE_START_MELODY = [
+  { note: 67, duration: 200 },
+  { note: 72, duration: 200 },
+  { note: 76, duration: 250 },
+  { note: 79, duration: 450 },
 ];
 // 勝利ファンファーレ（ド→ミ→ソ→高いド）
 const WIN_MELODY = [
@@ -259,6 +269,8 @@ function togglePause() {
     if (rescue !== null) {
       rescue.startedAt += pausedMs;
       rescue.nextActAt += pausedMs;
+      rescue.preludeUntil += pausedMs;
+      rescue.approachStartedAt += pausedMs;
     }
     if (celebrate !== null) {
       celebrate.startedAt += pausedMs;
@@ -650,10 +662,17 @@ function enterCelebrate(winnerIdx) {
     colorIdx: 0,
   };
   playMelody(cubes[winnerIdx], WIN_MELODY); // 勝った側がファンファーレを鳴らす
+  // 踊るのは勝った鬼側だけ。負けた側は止めて見届けさせ、どちらが勝ったか一目で分かるようにする
+  cubes.forEach((cube, i) => {
+    if (i !== winnerIdx) {
+      cube.move(0, 0, 100);
+      setLight(cube, LED_HOME);
+    }
+  });
 }
 
 function updateCelebrate() {
-  // 勝ったらその場で踊る。テーマが「友」なので負けた側も控えめに一緒に踊る
+  // 勝った鬼側だけがその場で踊る（負けた側はenterCelebrateで停止させたまま見届ける）
   const now = millis();
 
   if (now - celebrate.startedAt > DANCE_MS) {
@@ -666,17 +685,15 @@ function updateCelebrate() {
     celebrate.spin *= -1; // 左右交互に回してくねらせる
     celebrate.colorIdx = (celebrate.colorIdx + 1) % DANCE_COLORS.length;
 
-    cubes.forEach((cube, i) => {
-      const base =
-        i === celebrate.winnerIdx
-          ? DANCE_SPEED
-          : Math.round(DANCE_SPEED * DANCE_LOSER_RATIO);
-      // 左右モーターを逆向きに回してその場スピン。位置がほとんど動かないので
-      // 踊ったあとスタート地点まで戻る距離も変わらない
-      cube.move(base * celebrate.spin, -base * celebrate.spin, DANCE_STEP_MS);
-      // 2台で色をずらして、交互に光っているように見せる
-      setLight(cube, DANCE_COLORS[(celebrate.colorIdx + i) % DANCE_COLORS.length]);
-    });
+    const winnerCube = cubes[celebrate.winnerIdx];
+    // 左右モーターを逆向きに回してその場スピン。位置がほとんど動かないので
+    // 踊ったあとスタート地点まで戻る距離も変わらない
+    winnerCube.move(
+      DANCE_SPEED * celebrate.spin,
+      -DANCE_SPEED * celebrate.spin,
+      DANCE_STEP_MS
+    );
+    setLight(winnerCube, DANCE_COLORS[celebrate.colorIdx]);
   }
 }
 
@@ -684,25 +701,34 @@ function updateCelebrate() {
 function enterRescue(kind, targetIdx) {
   phase = "RESCUE";
   const helperIdx = targetIdx === chaserIdx ? runnerIdx : chaserIdx;
+  const now = millis();
   rescue = {
     kind, // "OFF_MAT" | "STUCK_ON_MAT"
     targetIdx,
     helperIdx,
-    startedAt: millis(),
+    startedAt: now,
+    preludeUntil: now + RESCUE_PRELUDE_MS, // ここまでは動かず、音楽で救助開始を予告する
     retries: 0,
     step: "APPROACH", // STUCK_ON_MATのみ使用: "APPROACH" | "ACT" | "BUMP"
+    approachStartedAt: now, // 接近の見切り判定用
     nextActAt: 0,
   };
-  // 遷移直後から救助中と分かるようLEDを点け、サイレンもすぐ鳴らす
+  // 遷移直後から救助中と分かるようLEDを点ける
   blinkOn = true;
-  lastBlinkAt = millis();
-  lastSoundAt = 0;
+  lastBlinkAt = now;
+  // サイレンは予告ジングルと重ならないよう、1周期(SIREN_MS)あとから鳴らし始める
+  lastSoundAt = now;
   setLight(cubes[targetIdx], LED_TARGET);
   setLight(cubes[helperIdx], LED_RESCUER);
+  // 追跡中の移動コマンドを打ち切って一拍置き、「音楽 → 救助開始」の流れを見せる
+  cubes.forEach((cube) => cube.move(0, 0, 100));
+  playMelody(cubes[helperIdx], RESCUE_START_MELODY);
 }
 
 function updateRescue() {
   updateRescueEffects(); // 救助中であることをLEDとサイレンで示す
+  // 予告演出中は動かない。音楽を鳴らし終えてから救助動作に入る
+  if (millis() < rescue.preludeUntil) return;
   if (rescue.kind === "OFF_MAT") updateRescueOffMat();
   else updateRescueStuck();
 }
@@ -766,17 +792,23 @@ function updateRescueOffMat() {
     helper.lastCmdAt = now;
   }
 
-  // 最後の進行方向(lastHeading)の逆向きへ後退させる。送るたびリトライ回数を進め、次の実行時刻を延ばす
+  // 後退でマットへ戻す。まっすぐ下がるだけだと落ちた向きによっては戻れないため、
+  // リトライごとに「直進 → 左寄り → 右寄り」と後退の角度を変えて、戻れる向きを探す
   if (now >= rescue.nextActAt) {
-    targetCube.move(-RESCUE_SPEED, -RESCUE_SPEED, BACK_MS + rescue.retries * 200);
+    const durMs = BACK_MS + rescue.retries * 200;
+    const slow = -Math.max(8, Math.round(RESCUE_SPEED * 0.4)); // 速度の有効値域(±8..115)を下回らないようにする
+    const backPattern = rescue.retries % 3;
+    if (backPattern === 0) targetCube.move(-RESCUE_SPEED, -RESCUE_SPEED, durMs);
+    else if (backPattern === 1) targetCube.move(-RESCUE_SPEED, slow, durMs);
+    else targetCube.move(slow, -RESCUE_SPEED, durMs);
     rescue.retries++;
-    rescue.nextActAt = now + BACK_MS + rescue.retries * 200 + 400;
+    rescue.nextActAt = now + durMs + 400;
   }
 }
 
 function updateRescueStuck() {
-  // 救助側が横から押し、本人は後退する。押す向きと後退向きを直交させることで
-  // 互いを打ち消さず、かつ本人を障害物へ押し付けないようにする。
+  // 引っかかり方は毎回違うため、1つの戦術に固執しない。リトライごとに
+  // 「横から押す → 切り返しでこじる → マット中心へ押し込む」を順に試して脱出率を上げる
   const now = millis();
   const target = states[rescue.targetIdx];
   const helper = states[rescue.helperIdx];
@@ -797,10 +829,18 @@ function updateRescueStuck() {
     return;
   }
 
+  const tactic = rescue.retries % 3; // 0:横から押す 1:切り返しでこじる 2:中心へ押し込む
+
   if (rescue.step === "APPROACH") {
+    // 壁際などで接近地点に着けないまま粘ると、残りの戦術を試す時間まで食い潰すため見切る
+    if (now - rescue.approachStartedAt > APPROACH_GIVEUP_MS) {
+      rescue.retries++;
+      rescue.approachStartedAt = now;
+      return;
+    }
     if (target.pos !== null) {
-      const perp = pickApproachPerp(target);
-      const approachPoint = clampToSafe(vAdd(target.pos, vScale(perp, APPROACH_DIST)));
+      const dir = pickApproachDir(target, tactic);
+      const approachPoint = clampToSafe(vAdd(target.pos, vScale(dir, APPROACH_DIST)));
       if (now - helper.lastCmdAt > MOVE_INTERVAL) {
         helperCube.moveTo(approachPoint, RESCUE_SPEED);
         helper.lastCmdAt = now;
@@ -821,28 +861,52 @@ function updateRescueStuck() {
     }
   } else if (rescue.step === "BUMP") {
     if (now >= rescue.nextActAt) {
-      helperCube.move(RESCUE_SPEED, RESCUE_SPEED, BUMP_MS); // 横から押す
-      targetCube.move(-RESCUE_SPEED, -RESCUE_SPEED, BACK_MS); // 同時に後退
+      // 押す瞬間だけ速度を上げる。RESCUE_SPEEDのままだと押し負けて動かせないことがある
+      helperCube.move(PUSH_SPEED, PUSH_SPEED, BUMP_MS);
+      if (tactic === 0) {
+        // 横押し: 本人は後退。押す向きと直交しているので互いを打ち消さない
+        targetCube.move(-RESCUE_SPEED, -RESCUE_SPEED, BACK_MS);
+      } else if (tactic === 1) {
+        // 切り返し: 左右の車輪を不均等に回して車体をこじり、引っかかりを外す
+        // （車のスタック脱出と同じ要領。リトライごとにこじる向きを入れ替える）
+        const slow = -Math.max(8, Math.round(ESCAPE_SPEED * 0.3));
+        if (rescue.retries % 2 === 0) targetCube.move(-ESCAPE_SPEED, slow, BACK_MS);
+        else targetCube.move(slow, -ESCAPE_SPEED, BACK_MS);
+      } else {
+        // 中心へ押し込み: 本人はマット中心へ自走する（moveToが旋回も担う）。
+        // 後退では抜けない引っかかりを、向きを変えた前進で外す狙い
+        targetCube.moveTo({ x: MAT.centerX, y: MAT.centerY }, ESCAPE_SPEED);
+      }
       rescue.retries++;
       rescue.step = "APPROACH";
+      // 次の接近の見切りは、押し出し・脱出動作が終わってから数え始める
+      rescue.approachStartedAt = now + BACK_MS + 600;
       rescue.nextActAt = now + BACK_MS + 600;
     }
   }
 }
 
-function pickApproachPerp(target) {
-  // lastHeadingを90°回転させた2候補のうち、マット中心に近づく方を選ぶ
-  // （lastHeadingが無ければマット中心へ向かうベクトルで代用する）
+function pickApproachDir(target, tactic) {
+  // 戦術ごとに救助側の立ち位置を変え、毎回違う角度から力を加える。
+  // 0: 進行方向と直交（マット中心寄り） 1: その反対側 2: 中心から見て裏側（中心へ押し込むため）
+  const center = { x: MAT.centerX, y: MAT.centerY };
+  if (tactic === 2) {
+    const out = vNorm(vSub(target.pos, center));
+    if (vLen(out) === 0) return { x: 1, y: 0 }; // targetが中心と完全一致した場合の保険
+    return out;
+  }
   if (target.lastHeading === null) {
-    return vNorm(vSub({ x: MAT.centerX, y: MAT.centerY }, target.pos));
+    // 進行方向が取れなければ中心向きで代用し、反対側戦術のときは裏返す
+    const inward = vNorm(vSub(center, target.pos));
+    return tactic === 0 ? inward : vScale(inward, -1);
   }
   const h = target.lastHeading;
   const perpA = { x: -h.y, y: h.x };
   const perpB = { x: h.y, y: -h.x };
-  const center = { x: MAT.centerX, y: MAT.centerY };
   const candA = vAdd(target.pos, vScale(perpA, APPROACH_DIST));
   const candB = vAdd(target.pos, vScale(perpB, APPROACH_DIST));
-  return vDist(candA, center) <= vDist(candB, center) ? perpA : perpB;
+  const centerSide = vDist(candA, center) <= vDist(candB, center) ? perpA : perpB;
+  return tactic === 0 ? centerSide : vScale(centerSide, -1);
 }
 
 // ==== phase: REGROUP ====
