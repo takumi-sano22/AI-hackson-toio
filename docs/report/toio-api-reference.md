@@ -15,7 +15,7 @@
 | # | 落とし穴 | 正しい扱い |
 |---|---|---|
 | 1 | **モーター速度は絶対値 8 未満が無効** | `move(3, 3)` は動かない。有効域は `-115〜-8` / `8〜115` / `0`。微速移動は速度ではなく `duration` を短くして実現する |
-| 2 | **`duration` の単位は msec だが分解能は 10ms** | BLE 仕様は 10ms 単位（0〜255）。`move(s, s, 25)` は実質 2〜3 ステップ分しか動かない。最大 2550ms、`0` は無期限（次の書き込みまで継続） |
+| 2 | **`duration` の単位は msec だが分解能は 10ms** | BLE 仕様は 10ms 単位（0〜255）。`move(s, s, 25)` のような 10ms 未満の端数を含む指定は 2〜3 ステップ相当に量子化される（**丸めの方向は未確認**）。最大 2550ms、`0` は無期限（次の書き込みまで継続） |
 | 3 | **`angle` の単位は p5 の `angleMode()` に追従** | 既定は `RADIANS`。`angleMode(DEGREES)` を呼ぶと `cube.angle` も `turnTo()` も度になる。混在させない |
 | 4 | **Web Bluetooth の接続はユーザー操作イベント内からしか呼べない** | `connectNewP5tCube()` は必ずボタンの `mousePressed` 等から呼ぶ。`setup()` で自動接続は不可 |
 | 5 | **複数台接続は 1 台ずつダイアログが出る** | N 台なら N 回クリックが必要。一括接続 API は存在しない |
@@ -202,6 +202,7 @@ cube.addEventListener('sensorcollision', () => cube.playSE(P5tCube.seId.effect1)
 | 連続点灯シナリオ（最大 29 ステップ） | 未対応 | `setTimeout` / `draw()` で自前実装 |
 | 各種設定変更（水平検出しきい値・衝突検出しきい値・ダブルタップ間隔・ID 通知間隔・スピーカー消音など） | `configMagnet` 以外は未対応 | 既定値で運用する |
 | モーター制御の応答値ハンドリング | 公開 API 無し | 座標を監視して到着・タイムアウトを自前判定する |
+| 磁力の強さ・方向の取得 | 未対応（`magnet` は装着パターン 6 種の文字列のみ） | なし |
 
 > **上記が必要な場合**の選択肢: 公式 SDK の `toio.js`（Node.js）／`toio.py`（Python）／`toio SDK for Unity` はいずれも MIT ライセンスで、より広い仕様をカバーしている。ただしブラウザ完結ではなくなる。
 
@@ -250,7 +251,7 @@ cube.addEventListener('sensorcollision', () => cube.playSE(P5tCube.seId.effect1)
 | `P5tId.SimpleCardSymbol` | 12 | `markExclamation: 3670305`, `markQuestion: 3670335`, `markPlus: 3670315`, `markMinus: 3670317`, `markEqual: 3670333`, `markMultiple: 3670314`, `markDivision: 3670319`, `markPercent: 3670309`, `markUp: 3670366`, `markDown: 3670367`, `markLeft: 3670332`, `markRight: 3670334` |
 | `P5tId.Card` | 13 | トイオ・コレクション同梱のバトルカード（`typhoonCard: 3670016`, `rushCard: 3670054`, `goCard: 3670028` ほか） |
 | `P5tId.Sticker` | 6 | `speedUpSticker: 3670066`, `speedDownSticker: 3670030`, `wobbleSticker: 3670068`, `panicSticker: 3670032`, `spinSticker: 3670070`, `shockSticker: 3670034` |
-| `P5tId.Skunk` | 6 | `blueSkunk: 3670078` ほか 6 色 |
+| `P5tId.Skunk` | 6 | `blueSkunk: 3670078` ほか計 6 色（青・緑・黄・橙・赤・茶） |
 | `P5tId.GameMark` | 25 | ゲームメニュー用マーク |
 
 > **企画への示唆**: 数字 0〜9・アルファベット A〜Z・記号（`+ - × ÷ = ! ? % ↑↓←→`）が連番 ID で揃っているため、**カードを並べて「文字列」や「数式」を物理的に組み立てさせる**入力インターフェースが作れる。
@@ -305,7 +306,7 @@ Service UUID: `10B20100-5B3B-4571-9508-CF3EFCD7BBAE`
 
 | 対象 | URL |
 |---|---|
-| p5.toio 公式サイト・API リファレンス | https://tetunori.github.io/p5.toio/docs/cube/classes/p5tcube |
+| p5.toio 配布サイト・API リファレンス（**非公式・コミュニティ製**） | https://tetunori.github.io/p5.toio/docs/cube/classes/p5tcube |
 | p5.toio リポジトリ | https://github.com/tetunori/p5.toio |
 | toio コアキューブ技術仕様（BLE） | https://toio.github.io/toio-spec/ |
 | toio 公式サイト | https://toio.io/ |
