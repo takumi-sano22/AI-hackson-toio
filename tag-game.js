@@ -61,18 +61,6 @@ const OBSTACLE_FRONT = 25; // 実際の障害物は車体中心より進行方�
 const OBSTACLE_MAX = 20; // 記録上限
 const OBSTACLE_AIM_GAIN = 60; // 鬼の狙点をずらす量（moveTo は直線移動なので狙点で迂回させる）
 
-// ==== 沼（仮想地形） ====
-// 実マット上には何も無いが、「片方だけが入れる沼」というルール上の仮想エリアとして扱い、UIに描画する。
-// 適用はCHASE中のみ。救助・帰還はゲームの進行を優先し、沼を横切ってよいものとする
-const SWAMP = { x: 190, y: 290, r: 55 }; // 中心と半径（マット座標系）
-const SWAMP_BLOCKED_IDX = 1; // 沼に入れない機（Cube2）。Cube1（idx 0）は入れる
-const SWAMP_MARGIN = 12; // 入れない機が縁から取る距離
-const SWAMP_SLOW_RATIO = 0.55; // 入れる側が沼の中で受ける減速率（足を取られる演出）
-const SWAMP_LURE_DIST = 160; // 追われているとき、この距離以内なら沼へ避難し始める
-const SWAMP_PATROL_DEG = 40; // 逃げが沼に籠もったとき、鬼が縁を回り込む角度刻み
-const W_SWAMP = 2.0; // 入れない機の沼反発の重み（壁と同等に強く）
-const W_SWAMP_LURE = 0.8; // 沼への誘引の重み（away/sideより弱く、あくまで方向づけ）
-
 // ==== LED（色文字列の解釈がバージョン依存になりうるため RGB で直接指定する） ====
 const LED_CHASER = [255, 0, 0]; // 鬼
 const LED_RUNNER = [0, 80, 255]; // 逃げ
@@ -327,7 +315,6 @@ function draw() {
   translate(-BASE_W / 2, -BASE_H / 2);
 
   drawMat();
-  drawSwamp();
   drawObstacles();
   drawHomes();
   if (cubes.length < 2) {
@@ -518,73 +505,6 @@ function steerAim(from, aim) {
   return clampToSafe(vAdd(aim, vScale(rep, OBSTACLE_AIM_GAIN)));
 }
 
-// ==== 沼（仮想地形）のロジック ====
-function inSwamp(p) {
-  return vDist(p, SWAMP) <= SWAMP.r;
-}
-
-function swampExitAim(from) {
-  // 沼の中から最短で外へ出る点（中心から見て自分側の縁の少し外）
-  const out = vNorm(vSub(from, SWAMP));
-  const dir = vLen(out) === 0 ? { x: 1, y: 0 } : out; // 中心と完全一致した場合の保険
-  return clampToSafe(vAdd(SWAMP, vScale(dir, SWAMP.r + SWAMP_MARGIN)));
-}
-
-function swampRepulsion(p, idx) {
-  // 入れない機にだけ働く「沼から離れる向き」のベクトル（壁反発と同じ考え方）
-  if (idx !== SWAMP_BLOCKED_IDX) return { x: 0, y: 0 };
-  const d = vDist(p, SWAMP);
-  const range = SWAMP.r + WALL_RANGE;
-  if (d >= range) return { x: 0, y: 0 };
-  const out = d === 0 ? { x: 1, y: 0 } : vNorm(vSub(p, SWAMP));
-  return vScale(out, (range - d) / range);
-}
-
-function swampSpeed(idx, pos, speed) {
-  // 入れる側も沼の中では足を取られて遅くなる（仮想地形としての沼らしさ）
-  if (idx !== SWAMP_BLOCKED_IDX && pos !== null && inSwamp(pos)) {
-    return Math.max(8, Math.round(speed * SWAMP_SLOW_RATIO));
-  }
-  return speed;
-}
-
-function avoidSwampAim(from, aim) {
-  // 入れない機の狙点を沼の外へ補正する
-  const edgeR = SWAMP.r + SWAMP_MARGIN;
-  // 何かの拍子に沼へ踏み込んでしまっていたら、最優先で外へ出る
-  if (inSwamp(from)) return swampExitAim(from);
-  // 狙点が沼の中（逃げが沼へ避難した等）なら、縁に沿って回り込みながら出てくるのを待ち構える。
-  // その場停止で待つとスタック誤検知で救助が発動してしまうため、動き続ける形にしている
-  if (vDist(aim, SWAMP) < edgeR) {
-    const rel = vSub(from, SWAMP);
-    const ang = Math.atan2(rel.y, rel.x) + (SWAMP_PATROL_DEG * Math.PI) / 180;
-    return clampToSafe(
-      vAdd(SWAMP, { x: Math.cos(ang) * edgeR, y: Math.sin(ang) * edgeR })
-    );
-  }
-  // 狙点への直線が沼を横切るなら、縁の横を経由する迂回点に差し替える（近い側を選ぶ）
-  if (segmentHitsSwamp(from, aim, edgeR)) {
-    const rel = vNorm(vSub(from, SWAMP));
-    const detourA = vAdd(SWAMP, vScale({ x: -rel.y, y: rel.x }, edgeR + 10));
-    const detourB = vAdd(SWAMP, vScale({ x: rel.y, y: -rel.x }, edgeR + 10));
-    const costA = vDist(from, detourA) + vDist(detourA, aim);
-    const costB = vDist(from, detourB) + vDist(detourB, aim);
-    return clampToSafe(costA <= costB ? detourA : detourB);
-  }
-  return aim;
-}
-
-function segmentHitsSwamp(a, b, radius) {
-  // 線分abと沼中心の最短距離が radius 未満なら「横切る」とみなす
-  const ab = vSub(b, a);
-  const len2 = ab.x * ab.x + ab.y * ab.y;
-  if (len2 === 0) return vDist(a, SWAMP) < radius;
-  let t = ((SWAMP.x - a.x) * ab.x + (SWAMP.y - a.y) * ab.y) / len2;
-  t = Math.max(0, Math.min(1, t));
-  const closest = { x: a.x + ab.x * t, y: a.y + ab.y * t };
-  return vDist(closest, SWAMP) < radius;
-}
-
 // ==== phase: CHASE ====
 function enterChase() {
   phase = "CHASE";
@@ -637,10 +557,7 @@ function updateChase() {
     // 近距離では減速する。全速のまま突っ込むと正面衝突して2台が固まり、
     // 何が起きているのか見て分からなくなる
     const speed = gap < NEAR_DIST ? NEAR_SPEED : SPEED;
-    let aim = steerAim(chaserSt.pos, lead);
-    // 入れない機が鬼のときは沼を迂回する。逃げが沼へ避難したら縁を回り込んで出待ちする
-    if (chaserIdx === SWAMP_BLOCKED_IDX) aim = avoidSwampAim(chaserSt.pos, aim);
-    chaserCube.moveTo(aim, swampSpeed(chaserIdx, chaserSt.pos, speed));
+    chaserCube.moveTo(steerAim(chaserSt.pos, lead), speed);
     chaserSt.lastCmdAt = now;
   }
 
@@ -653,33 +570,15 @@ function updateChase() {
     const side = vScale(pickSideDir(away, runnerSt.pos), sideGain);
     const wall = wallRepulsion(runnerSt.pos);
     const obst = obstacleRepulsion(runnerSt.pos);
-    // 沼: 入れない機なら反発して避ける。入れる機が追われているときは沼へ避難する。
-    // すでに沼の中にいるときは誘引を切り、awayに任せて反対側へ通り抜けさせる（籠もって停滞させない）
-    const swampAvoid = swampRepulsion(runnerSt.pos, runnerIdx);
-    let lure = { x: 0, y: 0 };
-    if (
-      runnerIdx !== SWAMP_BLOCKED_IDX &&
-      gap < SWAMP_LURE_DIST &&
-      !inSwamp(runnerSt.pos)
-    ) {
-      lure = vNorm(vSub(SWAMP, runnerSt.pos));
-    }
     let dir = vNorm(
       vAdd(
-        vAdd(
-          vAdd(vScale(away, W_AWAY), vScale(side, W_SIDE)),
-          vAdd(vScale(wall, W_WALL), vScale(obst, W_OBST))
-        ),
-        vAdd(vScale(swampAvoid, W_SWAMP), vScale(lure, W_SWAMP_LURE))
+        vAdd(vScale(away, W_AWAY), vScale(side, W_SIDE)),
+        vAdd(vScale(wall, W_WALL), vScale(obst, W_OBST))
       )
     );
     if (vLen(dir) === 0) dir = away; // 合成がゼロベクトルになったらawayで代用する
-    let aim = clampToSafe(vAdd(runnerSt.pos, vScale(dir, STEP)));
-    // 入れない機が逃げで沼に踏み込んでしまったら、最優先で外へ出す
-    if (runnerIdx === SWAMP_BLOCKED_IDX && inSwamp(runnerSt.pos)) {
-      aim = swampExitAim(runnerSt.pos);
-    }
-    runnerCube.moveTo(aim, swampSpeed(runnerIdx, runnerSt.pos, SPEED));
+    const aim = clampToSafe(vAdd(runnerSt.pos, vScale(dir, STEP)));
+    runnerCube.moveTo(aim, SPEED);
     runnerSt.lastCmdAt = now;
   }
 
@@ -1153,24 +1052,6 @@ function toDisplay(p) {
   };
 }
 
-function drawSwamp() {
-  // 沼は仮想地形で実マット上には無いため、UIに描いて観客・操作者と認識を合わせる
-  const d = toDisplay(SWAMP);
-  const scaleX = MAT_W / (MAT.maxX - MAT.minX);
-  const r = SWAMP.r * scaleX;
-  noStroke();
-  fill(70, 120, 80, 110); // 濁った深緑で「入れる/入れない」が直感的に伝わる沼らしい見た目にする
-  circle(d.x, d.y, r * 2);
-  fill(50, 95, 65, 130);
-  circle(d.x, d.y, r * 1.35);
-  fill(240);
-  textAlign(CENTER, CENTER);
-  textSize(12);
-  text("沼", d.x, d.y - 7);
-  textSize(9);
-  text(`Cube${SWAMP_BLOCKED_IDX + 1}は入れない`, d.x, d.y + 9);
-}
-
 function drawObstacles() {
   // 2台が共有している障害物マップを可視化する（共通の認識を持っていることを見せる）
   const scaleX = MAT_W / (MAT.maxX - MAT.minX);
@@ -1341,9 +1222,6 @@ function drawHud() {
     }
 
     text(`障害物マップ（2台で共有）: ${obstacles.length} 箇所`, x, y);
-    y += lineH;
-
-    text(`沼: Cube${SWAMP_BLOCKED_IDX + 1}は入れない（追跡中のみ有効）`, x, y);
     y += lineH;
 
     if (rescue !== null) {
