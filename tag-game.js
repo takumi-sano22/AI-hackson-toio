@@ -63,6 +63,7 @@ let catchSince = null; // CHASE中、捕獲距離内に入り続けている開�
 let rescue = null; // RESCUE/HELP_NEEDED中の救助コンテキスト
 let regroupUntil = 0; // REGROUP待機の終了時刻
 let pausedFromPhase = null; // PAUSEDに入る直前のphase（スペースキーで復帰するため）
+let pausedAt = 0; // PAUSEDに入った時刻（復帰時に各期限を停止時間ぶん後ろへずらす）
 let blinkOn = false; // HELP_NEEDED中のトラブル機LED点滅の状態
 let lastBlinkAt = 0; // 直前の点滅切り替え時刻
 
@@ -152,12 +153,22 @@ function keyPressed() {
 
 function togglePause() {
   if (phase === "PAUSED") {
-    // 直前のphaseへ復帰。停止していた時間をスタック判定に持ち越さない
+    // 直前のphaseへ復帰。停止していた時間ぶん各期限を後ろへずらす。
+    // ずらさないと、長く止めただけで救助タイムアウトや捕獲が勝手に成立してしまう
+    const pausedMs = millis() - pausedAt;
+    if (rescue !== null) {
+      rescue.startedAt += pausedMs;
+      rescue.nextActAt += pausedMs;
+    }
+    regroupUntil += pausedMs;
+    if (catchSince !== null) catchSince += pausedMs;
+
     phase = pausedFromPhase || "CHASE";
     pausedFromPhase = null;
-    resetStuckDetection();
+    resetStuckDetection(); // 停止していた時間をスタック判定に持ち越さない
   } else {
     pausedFromPhase = phase;
+    pausedAt = millis();
     phase = "PAUSED";
     // 毎フレーム送ると詰まるため、停止コマンドは1回だけ送る
     cubes.forEach((cube) => cube.move(0, 0, 100));
@@ -444,6 +455,13 @@ function updateRescueOffMat() {
     return;
   }
 
+  // 打ち切り判定は後退を送る前に置く。送った直後に判定すると、
+  // 上限回目の後退が効いたかどうかを見ないままHELP_NEEDEDへ落ちてしまう
+  if (rescue.retries >= RETRY_MAX || now - rescue.startedAt > RESCUE_TIMEOUT) {
+    enterHelpNeeded();
+    return;
+  }
+
   // helperはロスト地点に一番近い安全域内の点へ向かう。合流点であり誘導の目印になる
   if (now - helper.lastCmdAt > MOVE_INTERVAL && target.lastValidPos !== null) {
     helperCube.moveTo(clampToSafe(target.lastValidPos), RESCUE_SPEED);
@@ -455,10 +473,6 @@ function updateRescueOffMat() {
     targetCube.move(-RESCUE_SPEED, -RESCUE_SPEED, BACK_MS + rescue.retries * 200);
     rescue.retries++;
     rescue.nextActAt = now + BACK_MS + rescue.retries * 200 + 400;
-  }
-
-  if (rescue.retries > RETRY_MAX || now - rescue.startedAt > RESCUE_TIMEOUT) {
-    enterHelpNeeded();
   }
 }
 
@@ -478,6 +492,13 @@ function updateRescueStuck() {
     return;
   }
 
+  // 打ち切り判定は押し出しを送る前に置く。送った直後に判定すると、
+  // 上限回目の押し出しが効いたかどうかを見ないままHELP_NEEDEDへ落ちてしまう
+  if (rescue.retries >= RETRY_MAX || now - rescue.startedAt > RESCUE_TIMEOUT) {
+    enterHelpNeeded();
+    return;
+  }
+
   if (rescue.step === "APPROACH") {
     if (target.pos !== null) {
       const perp = pickApproachPerp(target);
@@ -486,7 +507,10 @@ function updateRescueStuck() {
         helperCube.moveTo(approachPoint, RESCUE_SPEED);
         helper.lastCmdAt = now;
       }
-      if (helper.pos !== null && vDist(helper.pos, target.pos) <= ARRIVE_DIST) {
+      // 到着判定はtargetとの距離ではなく接近地点との距離で見る。
+      // 接近地点はtargetからAPPROACH_DIST(60)離れた位置にあるため、
+      // target基準ではARRIVE_DIST(25)以内に入れず、永久にACTへ進めない
+      if (helper.pos !== null && vDist(helper.pos, approachPoint) <= ARRIVE_DIST) {
         rescue.step = "ACT";
         rescue.nextActAt = now;
       }
@@ -505,10 +529,6 @@ function updateRescueStuck() {
       rescue.step = "APPROACH";
       rescue.nextActAt = now + BACK_MS + 600;
     }
-  }
-
-  if (rescue.retries > RETRY_MAX || now - rescue.startedAt > RESCUE_TIMEOUT) {
-    enterHelpNeeded();
   }
 }
 
