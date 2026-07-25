@@ -1,0 +1,20 @@
+# Claude Code の作業ツリー置き場（マージ後に削除する一時物なので追跡しない）
+.claude/worktrees/
+
+# 認証情報・環境変数（誤コミット防止のため必ず除外）
+.env
+.env.*
+!.env.example
+
+# 依存（現状は CDN 読み込みのみで発生しないが、ツール導入時の保険）
+node_modules/
+npm-debug.log*
+
+# OS 生成ファイル
+.DS_Store
+Thumbs.db
+
+# エディタ設定
+.vscode/
+.idea/
+*.swp
