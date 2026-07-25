@@ -17,7 +17,7 @@ const MAT = {
 const SAFE_MARGIN = 30; // マット内側の安全マージン
 const WALL_RANGE = 60; // 壁反発が効き始める距離
 const LEAD_TIME = 0.35; // 鬼の先読み秒数
-const CATCH_DIST = 45; // 捕獲判定距離（接触する前に成立させたいので車体サイズより広くとる）
+const CATCH_DIST = 35; // 捕獲判定距離。車体幅(約32)とほぼ同じ＝ほぼ完全に接触したときだけ成立させる
 const CATCH_HOLD_MS = 300; // 捕獲成立に必要な継続時間
 const LOST_MS = 800; // 座標ロスト判定時間
 // 障害物に押し付けられて空転していると、座標ノイズや微小な首振りだけで5程度は「動いて」しまい、
@@ -54,19 +54,10 @@ const STEP = 70; // 逃走時の目標点までの距離
 const W_AWAY = 1.0; // 鬼からの反発重み
 const W_SIDE = 1.2; // 横へ回り込む重み（正面衝突回避用）
 const W_WALL = 2.0; // 壁からの反発重み（壁際で袋小路に入ると正面衝突しやすいので強め）
-const W_OBST = 1.6; // 障害物からの反発重み
 const APPROACH_DIST = 60; // 救助時に横へ回り込む距離
 const ARRIVE_DIST = 25; // 接近完了とみなす距離
 const VEL_EPS = 1; // これ未満の速度では進行方向を更新しない
 const VEL_SMOOTH = 0.3; // 速度の指数移動平均係数（座標ノイズで先読み点が暴れるのを抑える）
-
-// ==== 障害物マップ（2台で共有する共通認識） ====
-const OBSTACLE_MERGE_DIST = 45; // この距離以内の検知は同じ障害物として統合する
-const OBSTACLE_RANGE = 75; // 障害物の反発が効き始める距離
-const OBSTACLE_TTL = 45000; // 最後の検知からこの時間で忘れる（誤検知が溜まって走れなくなるのを防ぐ）
-const OBSTACLE_FRONT = 25; // 実際の障害物は車体中心より進行方向前方にあるため、その分ずらして記録する
-const OBSTACLE_MAX = 20; // 記録上限
-const OBSTACLE_AIM_GAIN = 60; // 鬼の狙点をずらす量（moveTo は直線移動なので狙点で迂回させる）
 
 // ==== LED（色文字列の解釈がバージョン依存になりうるため RGB で直接指定する） ====
 const LED_CHASER = [255, 0, 0]; // 鬼
@@ -139,7 +130,6 @@ const COLOR_MAIN = [0, 133, 250, 100]; // 少し透明なシアン
 // ==== グローバル状態 ====
 const cubes = []; // P5tCube（接続順）
 const states = []; // 各キューブの CubeState
-const obstacles = []; // 障害物マップ {x, y, hits, lastAt}。2台がこの1つを共有して回避する
 // "WAITING"（接続待ち） | "READY"（接続済み・スタート待ち） | "CHASE" | "CELEBRATE"
 // | "RESCUE" | "REGROUP" | "HELP_NEEDED" | "PAUSED"
 let phase = "WAITING";
@@ -196,7 +186,7 @@ function makeCubeState() {
     prevPos: null,
     velocity: { x: 0, y: 0 }, // 座標単位/秒
     lastValidPos: null, // 最後に読めた座標
-    lastHeading: null, // 最後の進行方向（正規化済み）。救助時の後退方向・障害物位置の推定に使う
+    lastHeading: null, // 最後の進行方向（正規化済み）。救助時の後退方向・押す向きの推定に使う
     homePos: null, // 起動地点。仕切り直しでは必ずここへ戻る
     lostSince: null, // 座標を失った時刻(millis)
     stillAnchor: null, // スタック判定の基準座標（ここからSTUCK_EPS以上離れたら「動いた」）
@@ -244,11 +234,9 @@ function connectToio() {
     connectBtn.html(cubes.length < 2 ? "次のtoioを接続" : "接続済み（2台）");
 
     // 衝突はプロパティで取れずイベントでしか拾えない。
-    // 検知した地点は共通の障害物マップへ入れ、以後は検知していない側の機も同じ点を避けて走る
+    // 「ぶつかって止まった」(BUMPED)判定に使うため、発生時刻を記録する
     cube.addEventListener("sensorcollision", () => {
-      registerObstacle(idx);
       playSound(cube, SE_HIT);
-      // 衝突後に速度が想定より落ちたかを見るため、発生時刻を残す
       states[idx].lastCollisionAt = millis();
     });
 
@@ -278,7 +266,6 @@ function keyPressed() {
     // スタート前は戻る先が未確定なので受け付けない
     if (cubes.length >= 2 && phase !== "READY") enterRegroup();
   }
-  if (key === "o" || key === "O") obstacles.length = 0; // 誤検知が溜まったときのリセット用
   if (key === " " && phase !== "READY") togglePause();
 }
 
@@ -299,7 +286,6 @@ function togglePause() {
     regroupStartedAt += pausedMs;
     if (regroupArrivedAt !== null) regroupArrivedAt += pausedMs;
     if (catchSince !== null) catchSince += pausedMs;
-    obstacles.forEach((o) => (o.lastAt += pausedMs)); // 停止中に障害物を忘れないようにする
 
     phase = pausedFromPhase || "CHASE";
     pausedFromPhase = null;
@@ -320,7 +306,6 @@ function togglePause() {
 function draw() {
   // メインループ: 状態更新 → フェーズ処理 → 描画
   updateStates();
-  forgetOldObstacles();
   updatePhase();
 
   background(240, 252, 257); // 水色
@@ -332,7 +317,6 @@ function draw() {
   translate(-BASE_W / 2, -BASE_H / 2);
 
   drawMat();
-  drawObstacles();
   drawHomes();
   if (cubes.length < 2) {
     drawWaitingMessage("c キー / ボタンで接続してください（2台必要）");
@@ -370,7 +354,7 @@ function updateStates() {
           vScale(rawVel, VEL_SMOOTH)
         );
       }
-      // 鬼の先読み・救助時の後退方向・障害物位置の推定に使うため、
+      // 鬼の先読み・救助時の後退方向・押す向きの推定に使うため、
       // ある程度動いているときだけ進行方向を更新する
       if (vLen(st.velocity) > VEL_EPS) {
         st.lastHeading = vNorm(st.velocity);
@@ -451,77 +435,6 @@ function playMelody(cube, melody) {
   if (typeof cube.playMelody === "function") cube.playMelody(melody);
 }
 
-// ==== 障害物マップ ====
-function registerObstacle(idx) {
-  // 衝突検知・スタック検知の発生地点を共通マップへ記録する。
-  // 検知するのは片方の機でも、記録先は1つなので両機が同じ点を避けるようになる
-  const st = states[idx];
-  const base = st.pos !== null ? st.pos : st.lastValidPos;
-  if (base === null) return; // 一度も座標が読めていない場合は記録しようがない
-
-  // ぶつかった相手は車体中心ではなく進行方向の少し先にあるため、その分ずらして記録する
-  const front =
-    st.lastHeading !== null
-      ? vScale(st.lastHeading, OBSTACLE_FRONT)
-      : { x: 0, y: 0 };
-  const p = vAdd(base, front);
-  const now = millis();
-
-  const known = obstacles.find((o) => vDist(o, p) < OBSTACLE_MERGE_DIST);
-  if (known) {
-    // 既知の障害物は検知位置を平均して精度を上げ、寿命を延ばす
-    known.x = (known.x * known.hits + p.x) / (known.hits + 1);
-    known.y = (known.y * known.hits + p.y) / (known.hits + 1);
-    known.hits++;
-    known.lastAt = now;
-    return;
-  }
-
-  // 上限に達したら「最後に検知した時刻が最も古い」ものを捨てる。
-  // 挿入順（shift）で捨てると、直近に再検知したばかりの現役の障害物が消えてしまう
-  if (obstacles.length >= OBSTACLE_MAX) {
-    let oldest = 0;
-    obstacles.forEach((o, i) => {
-      if (o.lastAt < obstacles[oldest].lastAt) oldest = i;
-    });
-    obstacles.splice(oldest, 1);
-  }
-  obstacles.push({ x: p.x, y: p.y, hits: 1, lastAt: now });
-}
-
-function forgetOldObstacles() {
-  // 誤検知が永久に残ると走れる範囲が痩せていくため、一定時間で忘れる
-  const now = millis();
-  for (let i = obstacles.length - 1; i >= 0; i--) {
-    if (now - obstacles[i].lastAt > OBSTACLE_TTL) obstacles.splice(i, 1);
-  }
-}
-
-function obstacleRepulsion(p) {
-  // 近い障害物ほど強く「離れる向き」に働くベクトルを返す（壁反発と同じ考え方）
-  let v = { x: 0, y: 0 };
-  obstacles.forEach((o) => {
-    const d = vDist(p, o);
-    if (d >= OBSTACLE_RANGE) return;
-    if (d === 0) {
-      // 進行方向が取れずキューブの真下に登録された場合。離れる向きが決まらないので
-      // マット中心へ逃がす（ここで諦めると記録した地点をまったく避けられなくなる）
-      v = vAdd(v, vNorm(vSub({ x: MAT.centerX, y: MAT.centerY }, p)));
-      return;
-    }
-    v = vAdd(v, vScale(vNorm(vSub(p, o)), (OBSTACLE_RANGE - d) / OBSTACLE_RANGE));
-  });
-  return v;
-}
-
-function steerAim(from, aim) {
-  // moveToは目標への直線移動なので、経路を曲げるには狙点そのものをずらすしかない。
-  // 自機まわりの障害物反発を狙点に足して迂回させる
-  const rep = obstacleRepulsion(from);
-  if (vLen(rep) === 0) return clampToSafe(aim);
-  return clampToSafe(vAdd(aim, vScale(rep, OBSTACLE_AIM_GAIN)));
-}
-
 // ==== phase: CHASE ====
 function enterChase() {
   phase = "CHASE";
@@ -557,8 +470,6 @@ function updateChase() {
   // RESCUE/PAUSED中は意図的な停止があるため検知しない。REGROUPでは帰還中の機に限って検知する
   const trouble = findTroubleIdx([chaserIdx, runnerIdx]);
   if (trouble !== null) {
-    // マット上で動けなくなった地点には障害物がある可能性が高い。共通マップに残して以後避ける
-    if (trouble.kind === "BUMPED") registerObstacle(trouble.idx);
     enterRescue(trouble.kind, trouble.idx);
     return;
   }
@@ -574,11 +485,11 @@ function updateChase() {
     // 近距離では減速する。全速のまま突っ込むと正面衝突して2台が固まり、
     // 何が起きているのか見て分からなくなる
     const speed = gap < NEAR_DIST ? NEAR_SPEED : SPEED;
-    chaserCube.moveTo(steerAim(chaserSt.pos, lead), speed);
+    chaserCube.moveTo(clampToSafe(lead), speed);
     chaserSt.lastCmdAt = now;
   }
 
-  // 逃げの回避: 鬼からの反発・横への回り込み・壁反発・障害物反発を合成して逃走方向を決める
+  // 逃げの回避: 鬼からの反発・横への回り込み・壁反発を合成して逃走方向を決める
   if (gap !== null && now - runnerSt.lastCmdAt > MOVE_INTERVAL) {
     const away = vNorm(vSub(runnerSt.pos, chaserSt.pos));
     // 真後ろへ逃げるだけだと鬼と一直線に並び、追いつかれた瞬間に正面から押し合いになる。
@@ -586,12 +497,8 @@ function updateChase() {
     const sideGain = gap < NEAR_DIST ? (NEAR_DIST - gap) / NEAR_DIST : 0;
     const side = vScale(pickSideDir(away, runnerSt.pos), sideGain);
     const wall = wallRepulsion(runnerSt.pos);
-    const obst = obstacleRepulsion(runnerSt.pos);
     let dir = vNorm(
-      vAdd(
-        vAdd(vScale(away, W_AWAY), vScale(side, W_SIDE)),
-        vAdd(vScale(wall, W_WALL), vScale(obst, W_OBST))
-      )
+      vAdd(vAdd(vScale(away, W_AWAY), vScale(side, W_SIDE)), vScale(wall, W_WALL))
     );
     if (vLen(dir) === 0) dir = away; // 合成がゼロベクトルになったらawayで代用する
     const aim = clampToSafe(vAdd(runnerSt.pos, vScale(dir, STEP)));
@@ -973,7 +880,6 @@ function updateRegroup() {
   // 到着済みの機は意図的に静止しているため検知対象から外す（誤救助の防止）
   const trouble = findTroubleIdx(movingIdx);
   if (trouble !== null) {
-    if (trouble.kind === "BUMPED") registerObstacle(trouble.idx);
     enterRescue(trouble.kind, trouble.idx);
     return;
   }
@@ -1068,23 +974,6 @@ function toDisplay(p) {
     x: map(p.x, MAT.minX, MAT.maxX, MAT_X, MAT_X + MAT_W),
     y: map(p.y, MAT.minY, MAT.maxY, MAT_Y, MAT_Y + MAT_H),
   };
-}
-
-function drawObstacles() {
-  // 2台が共有している障害物マップを可視化する（共通の認識を持っていることを見せる）
-  const scaleX = MAT_W / (MAT.maxX - MAT.minX);
-  obstacles.forEach((o) => {
-    const d = toDisplay(o);
-    noStroke();
-    fill(180, 120, 60, 40);
-    circle(d.x, d.y, OBSTACLE_RANGE * 2 * scaleX); // 回避が効く範囲
-    fill(150, 90, 40, 200);
-    circle(d.x, d.y, 16); // 障害物そのものの推定位置
-    fill(255);
-    textAlign(CENTER, CENTER);
-    textSize(9);
-    text(o.hits, d.x, d.y); // 何回ぶつかった地点か
-  });
 }
 
 function drawHomes() {
@@ -1239,9 +1128,6 @@ function drawHud() {
       y += lineH;
     }
 
-    text(`障害物マップ（2台で共有）: ${obstacles.length} 箇所`, x, y);
-    y += lineH;
-
     if (rescue !== null) {
       text(`救助リトライ: ${rescue.retries}/${RETRY_MAX}`, x, y);
       y += lineH;
@@ -1250,7 +1136,7 @@ function drawHud() {
 
   y += 6;
   text(
-    "[c]接続 [s]スタート/リスタート [r]仕切り直し [o]障害物クリア [f]全画面 [space]一時停止",
+    "[c]接続 [s]スタート/リスタート [r]仕切り直し [f]全画面 [space]一時停止",
     x,
     y
   );
