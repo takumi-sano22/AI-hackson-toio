@@ -42,6 +42,10 @@ const SPEED = 35; // 通常速度。挙動を目で追える速さを優先し�
 const NEAR_SPEED = 20; // 接近中の鬼の速度。全速のまま突っ込ませない
 const RESCUE_SPEED = 25; // 救助時の低速
 const PUSH_SPEED = 50; // 押し出し瞬間の速度（RESCUE_SPEEDのままだと押し負けて動かせないことがある）
+// 押せていない（リトライが進む）ときに押す角度を変える順番。
+// 真横 → 斜め2方向 → 反対の真横 → 反対の斜め2方向、と当たり方を変えて引っかかりを外す
+const PUSH_ANGLE_STEPS = [0, 35, -35, 180, 145, -145];
+const RETREAT_MS = 500; // 押したあと一旦離れる後退時間（次の角度へ回り込みやすくする）
 const NEAR_DIST = 90; // これ以内を「接近中」とみなす（鬼は減速・逃げは横へ回り込む）
 
 const BUMP_MS = 400; // 押し出し時間
@@ -90,14 +94,17 @@ const DANCE_COLORS = [
 // P5tCube.seId 相当。未対応バージョンでも落ちないよう playSound()/playMelody() 側でガードする
 const SE_RESCUE = 10; // effect2 相当（救助成功時）
 const SE_HIT = 2; // cancel 相当（衝突検知時）
-const SIREN_MS = 1600; // サイレンを鳴らし直す周期（メロディ長 1400ms + 間）
+const RESCUE_POP_MS = 2500; // 救助中の合図を鳴らし直す周期（間隔を空けて騒がしさを抑える）
 const HELP_CALL_MS = 3000; // 人待ち中の呼び出し音の周期
-// 救急車のピーポー音を MIDI ノートで模したもの（B5 ↔ G5）
-const SIREN_MELODY = [
-  { note: 83, duration: 350 },
-  { note: 79, duration: 350 },
-  { note: 83, duration: 350 },
-  { note: 79, duration: 350 },
+// 救助中のポップな合図（ド→ミ→ソのスタッカート）。duration の単位は 10ms（toio 仕様。255でクリップ）。
+// p5.toio の playMelody は音量が 255 固定で実音量は下げられないため、
+// サイレン風の高く長い連続音をやめ、中音域の短い音＋休符で「音量を下げたように」柔らかく聞こえさせる
+const RESCUE_POP_MELODY = [
+  { note: 72, duration: 10 },
+  { note: 128, duration: 8 }, // note 128 は休符
+  { note: 76, duration: 10 },
+  { note: 128, duration: 8 },
+  { note: 79, duration: 14 },
 ];
 // 人を呼ぶ音。note 128 は無音（休符）
 const HELP_MELODY = [
@@ -175,6 +182,11 @@ function vNorm(a) {
 }
 function vDist(a, b) {
   return vLen(vSub(a, b));
+}
+function vRotate(v, rad) {
+  const c = Math.cos(rad);
+  const s = Math.sin(rad);
+  return { x: v.x * c - v.y * s, y: v.x * s + v.y * c };
 }
 
 // ==== CubeState 生成 ====
@@ -736,13 +748,13 @@ function enterRescue(kind, targetIdx) {
     startedAt: now,
     preludeUntil: now + RESCUE_PRELUDE_MS, // ここまでは動かず、音楽で救助開始を予告する
     retries: 0,
-    step: "APPROACH", // BUMPEDのみ使用: "APPROACH" | "ACT" | "PUSH"
+    step: "APPROACH", // BUMPEDのみ使用: "APPROACH" | "ACT" | "PUSH" | "RETREAT"
     nextActAt: 0,
   };
   // 遷移直後から救助中と分かるようLEDを点ける
   blinkOn = true;
   lastBlinkAt = now;
-  // サイレンは予告ジングルと重ならないよう、1周期(SIREN_MS)あとから鳴らし始める
+  // 救助中の合図は予告ジングルと重ならないよう、1周期(RESCUE_POP_MS)あとから鳴らし始める
   lastSoundAt = now;
   setLight(cubes[targetIdx], LED_TARGET);
   setLight(cubes[helperIdx], LED_RESCUER);
@@ -778,10 +790,10 @@ function updateRescueEffects() {
     }
   }
 
-  // 救助に向かっている側から救急車のサイレンを鳴らす
-  if (now - lastSoundAt > SIREN_MS) {
+  // 救助に向かっている側からポップな合図を鳴らす（救助入りのアラートより軽い音）
+  if (now - lastSoundAt > RESCUE_POP_MS) {
     lastSoundAt = now;
-    playMelody(helperCube, SIREN_MELODY);
+    playMelody(helperCube, RESCUE_POP_MELODY);
   }
 }
 
@@ -857,7 +869,7 @@ function updateRescueBumped() {
 
   if (rescue.step === "APPROACH") {
     if (target.pos !== null) {
-      const perp = pickPushPerp(target);
+      const perp = pickPushPerp(target, rescue.retries);
       const approachPoint = clampToSafe(
         vAdd(target.pos, vScale(perp, APPROACH_DIST))
       );
@@ -883,29 +895,41 @@ function updateRescueBumped() {
     if (now >= rescue.nextActAt) {
       // 押す瞬間だけ速度を上げる（低速だと押し負けて動かせない）。本人は動かさない
       helperCube.move(PUSH_SPEED, PUSH_SPEED, BUMP_MS);
+      rescue.step = "RETREAT";
+      rescue.nextActAt = now + BUMP_MS + 200;
+    }
+  } else if (rescue.step === "RETREAT") {
+    if (now >= rescue.nextActAt) {
+      // 押せていなければ一旦離れて、次は別の角度から押し直す（回り込みの経路も確保できる）
+      helperCube.move(-RESCUE_SPEED, -RESCUE_SPEED, RETREAT_MS);
       rescue.retries++;
       rescue.step = "APPROACH";
-      rescue.nextActAt = now + BUMP_MS + 600;
+      rescue.nextActAt = now + RETREAT_MS + 300;
     }
   }
 }
 
-function pickPushPerp(target) {
-  // 衝突時の進行方向(lastHeading)に直交する2候補のうち、「押した先がマット中心へ向かう側」の
-  // 反対に立つ。中心へ向けて押せば、壁や別の障害物へさらに押し付けてしまうことを避けられる
+function pickPushPerp(target, retries) {
+  // 押す向きの基本は「衝突したときの進行方向の真横」＝cube自体を横方向へ押し出す。
+  // 直交2方向のうち、押した先がマット中心へ向かう側を基本にし
+  // （＝立ち位置は中心から遠い側）、壁や別の障害物へさらに押し付けてしまうことを避ける。
+  // 押せずにリトライが進んだら PUSH_ANGLE_STEPS に沿って角度を変え、別の当たり方を試す
   const center = { x: MAT.centerX, y: MAT.centerY };
+  let base;
   if (target.lastHeading === null) {
     // 進行方向が取れないときは、中心から見て外側に立って中心へ向けて押す
     const out = vNorm(vSub(target.pos, center));
-    return vLen(out) === 0 ? { x: 1, y: 0 } : out;
+    base = vLen(out) === 0 ? { x: 1, y: 0 } : out;
+  } else {
+    const h = target.lastHeading;
+    const perpA = { x: -h.y, y: h.x };
+    const perpB = { x: h.y, y: -h.x };
+    const candA = vAdd(target.pos, vScale(perpA, APPROACH_DIST));
+    const candB = vAdd(target.pos, vScale(perpB, APPROACH_DIST));
+    base = vDist(candA, center) >= vDist(candB, center) ? perpA : perpB;
   }
-  const h = target.lastHeading;
-  const perpA = { x: -h.y, y: h.x };
-  const perpB = { x: h.y, y: -h.x };
-  const candA = vAdd(target.pos, vScale(perpA, APPROACH_DIST));
-  const candB = vAdd(target.pos, vScale(perpB, APPROACH_DIST));
-  // 立ち位置は中心から遠い方＝押す向きが中心側になる方を選ぶ
-  return vDist(candA, center) >= vDist(candB, center) ? perpA : perpB;
+  const stepDeg = PUSH_ANGLE_STEPS[retries % PUSH_ANGLE_STEPS.length];
+  return vRotate(base, (stepDeg * Math.PI) / 180);
 }
 
 // ==== phase: REGROUP ====
