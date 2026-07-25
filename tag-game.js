@@ -25,10 +25,14 @@ const LOST_MS = 800; // 座標ロスト判定時間
 const STUCK_EPS = 15; // これ未満の移動量は「動いていない」とみなす
 const STUCK_MS = 1500; // マット内スタック判定時間（低速化で1コマンドあたりの移動が遅くなるため緩めた）
 const BACK_MS = 600; // 後退の基本時間
-const RETRY_MAX = 6; // 救助リトライ上限（3戦術を2周試せる回数にしている）
-const RESCUE_TIMEOUT = 15000; // 救助断念までの時間（戦術が増えたぶん延長）
+const RETRY_MAX = 6; // 救助リトライ上限（BUMPED=横押しの回数 / OFF_MAT=後退の回数）
+const RESCUE_TIMEOUT = 15000; // 救助断念までの時間
 const RESCUE_PRELUDE_MS = 1600; // 救助開始前の予告演出の長さ（音楽を鳴らし終えてから動き出す）
-const APPROACH_GIVEUP_MS = 3500; // 接近をあきらめて次の戦術に切り替えるまでの時間
+// 「なにかにぶつかって速度が想定より変わった」の判定
+const BUMP_WINDOW_MIN_MS = 250; // 衝突直後は平滑化した速度がまだ落ちきっていないため、判定を少し待つ
+const BUMP_WINDOW_MAX_MS = 900; // 衝突からこの時間内に減速が確認できたら「ぶつかって止まった」とみなす
+const BUMP_SLOW_SPEED = 15; // これ未満の実測速度（座標/秒）を「想定より遅い」とみなす
+const BUMP_IGNORE_GAP = 70; // 2台がこの距離以内での衝突はお互いの接触（捕獲判定に任せる）なので無視
 const REGROUP_HOLD_MS = 3000; // 全機がスタート地点に揃ってから再スタートまでの待機時間
 const REGROUP_TIMEOUT = 12000; // 定位置に戻れなくてもデモを止めないための打ち切り時間（待機ぶん延長）
 const HOME_ARRIVE_DIST = 30; // スタート地点に戻ったとみなす距離
@@ -38,7 +42,6 @@ const SPEED = 35; // 通常速度。挙動を目で追える速さを優先し�
 const NEAR_SPEED = 20; // 接近中の鬼の速度。全速のまま突っ込ませない
 const RESCUE_SPEED = 25; // 救助時の低速
 const PUSH_SPEED = 50; // 押し出し瞬間の速度（RESCUE_SPEEDのままだと押し負けて動かせないことがある）
-const ESCAPE_SPEED = 35; // スタック脱出時に本人が出す速度
 const NEAR_DIST = 90; // これ以内を「接近中」とみなす（鬼は減速・逃げは横へ回り込む）
 
 const BUMP_MS = 400; // 押し出し時間
@@ -187,6 +190,7 @@ function makeCubeState() {
     stillAnchor: null, // スタック判定の基準座標（ここからSTUCK_EPS以上離れたら「動いた」）
     lastMoveAt: 0, // 最後に基準座標からSTUCK_EPS以上離れた時刻(millis)
     lastCmdAt: 0, // 最後にBLEコマンドを送った時刻
+    lastCollisionAt: -10000, // 直近の衝突イベント時刻（「ぶつかって止まった」判定に使う）
   };
 }
 
@@ -232,6 +236,8 @@ function connectToio() {
     cube.addEventListener("sensorcollision", () => {
       registerObstacle(idx);
       playSound(cube, SE_HIT);
+      // 衝突後に速度が想定より落ちたかを見るため、発生時刻を残す
+      states[idx].lastCollisionAt = millis();
     });
 
     // 2台そろってもすぐには始めない。配置を終えてスタートを押すまでREADYで待つ
@@ -273,7 +279,6 @@ function togglePause() {
       rescue.startedAt += pausedMs;
       rescue.nextActAt += pausedMs;
       rescue.preludeUntil += pausedMs;
-      rescue.approachStartedAt += pausedMs;
     }
     if (celebrate !== null) {
       celebrate.startedAt += pausedMs;
@@ -541,7 +546,7 @@ function updateChase() {
   const trouble = findTroubleIdx([chaserIdx, runnerIdx]);
   if (trouble !== null) {
     // マット上で動けなくなった地点には障害物がある可能性が高い。共通マップに残して以後避ける
-    if (trouble.kind === "STUCK_ON_MAT") registerObstacle(trouble.idx);
+    if (trouble.kind === "BUMPED") registerObstacle(trouble.idx);
     enterRescue(trouble.kind, trouble.idx);
     return;
   }
@@ -641,16 +646,33 @@ function clampToSafe(p) {
 
 function findTroubleIdx(indices) {
   // OFF_MAT: 座標ロストがLOST_MSを超えて継続
-  // STUCK_ON_MAT: マット内で座標は読めているが移動が無い状態がSTUCK_MSを超えて継続
+  // BUMPED: なにかにぶつかって速度が想定より落ちた／移動が無い状態がSTUCK_MSを超えて継続
   // 検知対象は呼び出し元が絞る（意図的に静止している機を誤検知しないため）
   const now = millis();
+  const posA = states[chaserIdx].pos;
+  const posB = states[runnerIdx].pos;
+  const gap = posA !== null && posB !== null ? vDist(posA, posB) : null;
+
   for (const idx of indices) {
     const st = states[idx];
     if (st.lostSince !== null && now - st.lostSince > LOST_MS) {
       return { kind: "OFF_MAT", idx };
     }
+    // 衝突イベントの直後に実測速度が落ちていたら「ぶつかって止まった」。
+    // 2台が近接しているときの衝突はお互いの接触（捕獲のうち）なので対象外にする
+    const sinceHit = now - st.lastCollisionAt;
+    if (
+      st.pos !== null &&
+      sinceHit > BUMP_WINDOW_MIN_MS &&
+      sinceHit < BUMP_WINDOW_MAX_MS &&
+      vLen(st.velocity) < BUMP_SLOW_SPEED &&
+      (gap === null || gap > BUMP_IGNORE_GAP)
+    ) {
+      return { kind: "BUMPED", idx };
+    }
+    // 衝突イベントを拾えない引っかかり方への保険（従来のスタック検知）
     if (st.pos !== null && now - st.lastMoveAt > STUCK_MS) {
-      return { kind: "STUCK_ON_MAT", idx };
+      return { kind: "BUMPED", idx };
     }
   }
   return null;
@@ -708,14 +730,13 @@ function enterRescue(kind, targetIdx) {
   const helperIdx = targetIdx === chaserIdx ? runnerIdx : chaserIdx;
   const now = millis();
   rescue = {
-    kind, // "OFF_MAT" | "STUCK_ON_MAT"
+    kind, // "OFF_MAT" | "BUMPED"
     targetIdx,
     helperIdx,
     startedAt: now,
     preludeUntil: now + RESCUE_PRELUDE_MS, // ここまでは動かず、音楽で救助開始を予告する
     retries: 0,
-    step: "APPROACH", // STUCK_ON_MATのみ使用: "APPROACH" | "ACT" | "BUMP"
-    approachStartedAt: now + RESCUE_PRELUDE_MS, // 接近の見切りは予告演出が明けてから数え始める
+    step: "APPROACH", // BUMPEDのみ使用: "APPROACH" | "ACT" | "PUSH"
     nextActAt: 0,
   };
   // 遷移直後から救助中と分かるようLEDを点ける
@@ -735,7 +756,7 @@ function updateRescue() {
   // 予告演出中は動かない。音楽を鳴らし終えてから救助動作に入る
   if (millis() < rescue.preludeUntil) return;
   if (rescue.kind === "OFF_MAT") updateRescueOffMat();
-  else updateRescueStuck();
+  else updateRescueBumped();
 }
 
 function updateRescueEffects() {
@@ -811,48 +832,42 @@ function updateRescueOffMat() {
   }
 }
 
-function updateRescueStuck() {
-  // 引っかかり方は毎回違うため、1つの戦術に固執しない。リトライごとに
-  // 「横から押す → 切り返しでこじる → マット中心へ押し込む」を順に試して脱出率を上げる
+function updateRescueBumped() {
+  // ぶつかって止まった側は自力で脱出させず、静止したまま助けを待つ。
+  // もう一方が「衝突したときの進行方向に対して横」へ回り込み、横から押して復帰させる
   const now = millis();
   const target = states[rescue.targetIdx];
   const helper = states[rescue.helperIdx];
   const helperCube = cubes[rescue.helperIdx];
   const targetCube = cubes[rescue.targetIdx];
 
-  // 救助を始めてからtargetがSTUCK_EPS以上動いていれば脱出成功
+  // 押されてSTUCK_EPS以上動いたら復帰成功。仕切り直し(REGROUP)へ
   if (target.pos !== null && target.lastMoveAt > rescue.startedAt) {
     playSound(targetCube, SE_RESCUE);
     enterRegroup();
     return;
   }
 
-  // 打ち切り判定は押し出しを送る前に置く。送った直後に判定すると、
-  // 上限回目の押し出しが効いたかどうかを見ないままHELP_NEEDEDへ落ちてしまう
+  // 打ち切り判定は押す前に置く。押した直後に判定すると、
+  // 上限回目の押しが効いたかどうかを見ないままHELP_NEEDEDへ落ちてしまう
   if (rescue.retries >= RETRY_MAX || now - rescue.startedAt > RESCUE_TIMEOUT) {
     enterHelpNeeded();
     return;
   }
 
-  const tactic = rescue.retries % 3; // 0:横から押す 1:切り返しでこじる 2:中心へ押し込む
-
   if (rescue.step === "APPROACH") {
-    // 壁際などで接近地点に着けないまま粘ると、残りの戦術を試す時間まで食い潰すため見切る
-    if (now - rescue.approachStartedAt > APPROACH_GIVEUP_MS) {
-      rescue.retries++;
-      rescue.approachStartedAt = now;
-      return;
-    }
     if (target.pos !== null) {
-      const dir = pickApproachDir(target, tactic);
-      const approachPoint = clampToSafe(vAdd(target.pos, vScale(dir, APPROACH_DIST)));
+      const perp = pickPushPerp(target);
+      const approachPoint = clampToSafe(
+        vAdd(target.pos, vScale(perp, APPROACH_DIST))
+      );
       if (now - helper.lastCmdAt > MOVE_INTERVAL) {
         helperCube.moveTo(approachPoint, RESCUE_SPEED);
         helper.lastCmdAt = now;
       }
       // 到着判定はtargetとの距離ではなく接近地点との距離で見る。
       // 接近地点はtargetからAPPROACH_DIST(60)離れた位置にあるため、
-      // target基準ではARRIVE_DIST(25)以内に入れず、永久にACTへ進めない
+      // target基準ではARRIVE_DIST(25)以内に入れず、永久に次の段階へ進めない
       if (helper.pos !== null && vDist(helper.pos, approachPoint) <= ARRIVE_DIST) {
         rescue.step = "ACT";
         rescue.nextActAt = now;
@@ -861,57 +876,36 @@ function updateRescueStuck() {
   } else if (rescue.step === "ACT") {
     if (now >= rescue.nextActAt && target.pos !== null) {
       helperCube.turnToXY(target.pos.x, target.pos.y, RESCUE_SPEED);
-      rescue.nextActAt = now + 800;
-      rescue.step = "BUMP";
+      rescue.nextActAt = now + 800; // 旋回し終わるのを待ってから押す
+      rescue.step = "PUSH";
     }
-  } else if (rescue.step === "BUMP") {
+  } else if (rescue.step === "PUSH") {
     if (now >= rescue.nextActAt) {
-      // 押す瞬間だけ速度を上げる。RESCUE_SPEEDのままだと押し負けて動かせないことがある
+      // 押す瞬間だけ速度を上げる（低速だと押し負けて動かせない）。本人は動かさない
       helperCube.move(PUSH_SPEED, PUSH_SPEED, BUMP_MS);
-      if (tactic === 0) {
-        // 横押し: 本人は後退。押す向きと直交しているので互いを打ち消さない
-        targetCube.move(-RESCUE_SPEED, -RESCUE_SPEED, BACK_MS);
-      } else if (tactic === 1) {
-        // 切り返し: 左右の車輪を不均等に回して車体をこじり、引っかかりを外す
-        // （車のスタック脱出と同じ要領。リトライごとにこじる向きを入れ替える）
-        const slow = -Math.max(8, Math.round(ESCAPE_SPEED * 0.3));
-        if (rescue.retries % 2 === 0) targetCube.move(-ESCAPE_SPEED, slow, BACK_MS);
-        else targetCube.move(slow, -ESCAPE_SPEED, BACK_MS);
-      } else {
-        // 中心へ押し込み: 本人はマット中心へ自走する（moveToが旋回も担う）。
-        // 後退では抜けない引っかかりを、向きを変えた前進で外す狙い
-        targetCube.moveTo({ x: MAT.centerX, y: MAT.centerY }, ESCAPE_SPEED);
-      }
       rescue.retries++;
       rescue.step = "APPROACH";
-      // 次の接近の見切りは、押し出し・脱出動作が終わってから数え始める
-      rescue.approachStartedAt = now + BACK_MS + 600;
-      rescue.nextActAt = now + BACK_MS + 600;
+      rescue.nextActAt = now + BUMP_MS + 600;
     }
   }
 }
 
-function pickApproachDir(target, tactic) {
-  // 戦術ごとに救助側の立ち位置を変え、毎回違う角度から力を加える。
-  // 0: 進行方向と直交（マット中心寄り） 1: その反対側 2: 中心から見て裏側（中心へ押し込むため）
+function pickPushPerp(target) {
+  // 衝突時の進行方向(lastHeading)に直交する2候補のうち、「押した先がマット中心へ向かう側」の
+  // 反対に立つ。中心へ向けて押せば、壁や別の障害物へさらに押し付けてしまうことを避けられる
   const center = { x: MAT.centerX, y: MAT.centerY };
-  if (tactic === 2) {
-    const out = vNorm(vSub(target.pos, center));
-    if (vLen(out) === 0) return { x: 1, y: 0 }; // targetが中心と完全一致した場合の保険
-    return out;
-  }
   if (target.lastHeading === null) {
-    // 進行方向が取れなければ中心向きで代用し、反対側戦術のときは裏返す
-    const inward = vNorm(vSub(center, target.pos));
-    return tactic === 0 ? inward : vScale(inward, -1);
+    // 進行方向が取れないときは、中心から見て外側に立って中心へ向けて押す
+    const out = vNorm(vSub(target.pos, center));
+    return vLen(out) === 0 ? { x: 1, y: 0 } : out;
   }
   const h = target.lastHeading;
   const perpA = { x: -h.y, y: h.x };
   const perpB = { x: h.y, y: -h.x };
   const candA = vAdd(target.pos, vScale(perpA, APPROACH_DIST));
   const candB = vAdd(target.pos, vScale(perpB, APPROACH_DIST));
-  const centerSide = vDist(candA, center) <= vDist(candB, center) ? perpA : perpB;
-  return tactic === 0 ? centerSide : vScale(centerSide, -1);
+  // 立ち位置は中心から遠い方＝押す向きが中心側になる方を選ぶ
+  return vDist(candA, center) >= vDist(candB, center) ? perpA : perpB;
 }
 
 // ==== phase: REGROUP ====
@@ -955,7 +949,7 @@ function updateRegroup() {
   // 到着済みの機は意図的に静止しているため検知対象から外す（誤救助の防止）
   const trouble = findTroubleIdx(movingIdx);
   if (trouble !== null) {
-    if (trouble.kind === "STUCK_ON_MAT") registerObstacle(trouble.idx);
+    if (trouble.kind === "BUMPED") registerObstacle(trouble.idx);
     enterRescue(trouble.kind, trouble.idx);
     return;
   }
